@@ -14,6 +14,10 @@ INVOICE_NUM_PATTERNS = [
     (re.compile(r"(?:invoice\s*(?:no|number|#|num)[.:;\s]*)\s*([A-Z0-9][\w\-/]{2,20})", re.I), 95),
     (re.compile(r"(?:inv\s*[.:#\-]\s*)([A-Z0-9][\w\-/]{2,20})", re.I), 90),
     (re.compile(r"(?:bill\s*(?:no|number|#)[.:;\s]*)\s*([A-Z0-9][\w\-/]{2,20})", re.I), 80),
+    # Broader: "Invoice" followed by an alphanumeric code on the same line
+    (re.compile(r"invoice[.:;\s]+([A-Z0-9][\w\-/]{2,20})", re.I), 75),
+    # Reference number patterns
+    (re.compile(r"(?:ref(?:erence)?\s*(?:no|number|#)?[.:;\s]*)\s*([A-Z0-9][\w\-/]{2,20})", re.I), 70),
 ]
 
 PO_NUMBER_PATTERNS = [
@@ -125,16 +129,29 @@ def _extract_invoice_date(text: str) -> ExtractedField:
 
 
 def _extract_due_date(text: str) -> ExtractedField:
-    label_pattern = re.compile(
-        r"(?:due\s*date|payment\s*due|pay\s*by)[.:;\s]*(.{6,20})", re.I
-    )
-    m = label_pattern.search(text)
+    # Try labelled patterns with increasing flexibility
+    label_patterns = [
+        re.compile(r"(?:due\s*date|payment\s*due|pay\s*by)[.:;\s]*(.{6,30})", re.I),
+        # "Due Date" as a standalone label followed by a date on same or next line
+        re.compile(r"due\s*date\s*[.:;\s]*(.{6,30})", re.I),
+        # "Due" near a date
+        re.compile(r"(?:^|\s)due[.:;\s]+(.{6,20})", re.I | re.MULTILINE),
+    ]
+    for label_pat in label_patterns:
+        m = label_pat.search(text)
+        if m:
+            snippet = m.group(1)
+            for pat, conf in DATE_PATTERNS:
+                dm = pat.search(snippet)
+                if dm:
+                    return ExtractedField(value=dm.group(1).strip(), confidence=conf, source="regex_labelled")
+
+    # Broader fallback: scan entire text for "due date" near any date
+    due_date_broad = re.compile(r"due\s*date\s*[^A-Za-z]*?(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})", re.I)
+    m = due_date_broad.search(text)
     if m:
-        snippet = m.group(1)
-        for pat, conf in DATE_PATTERNS:
-            dm = pat.search(snippet)
-            if dm:
-                return ExtractedField(value=dm.group(1).strip(), confidence=conf, source="regex_labelled")
+        return ExtractedField(value=m.group(1).strip(), confidence=82, source="regex_broad")
+
     return ExtractedField(value=None, confidence=0, source="not_found")
 
 
@@ -149,18 +166,41 @@ def _extract_currency(text: str) -> ExtractedField:
 
 
 def _extract_vendor_name(text: str) -> ExtractedField:
-    """Heuristic: vendor name is typically at the very top of the invoice."""
+    """Extract vendor name – prefer labelled fields, fall back to heuristic."""
+    # Tier 1: Look for explicit labels
+    label_patterns = [
+        (re.compile(r"(?:vendor|supplier|seller|from|company)\s*(?:name)?[.:;\s]+(.+)", re.I), 88),
+        (re.compile(r"(?:bill\s*from|invoice\s*from)[.:;\s]+(.+)", re.I), 88),
+        (re.compile(r"(?:remit\s*to)[.:;\s]+(.+)", re.I), 85),
+    ]
+    for pat, conf in label_patterns:
+        m = pat.search(text)
+        if m:
+            val = m.group(1).strip().split("\n")[0].strip()
+            # Skip if it looks like a date or number
+            if val and not re.match(r"^[\d/\-]+$", val) and not re.match(r"^date", val, re.I):
+                return ExtractedField(value=val, confidence=conf, source="regex_labelled")
+
+    # Tier 2: Heuristic – vendor name is typically at the very top
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    # Skip very short lines or lines that look like headers
-    for line in lines[:8]:
+    for line in lines[:10]:
         if len(line) < 3:
             continue
-        if re.match(r"^(invoice|tax\s*invoice|bill|statement|page\s*\d)", line, re.I):
+        # Skip lines that look like headers, dates, numbers, or common labels
+        if re.match(r"^(invoice|tax\s*invoice|bill|statement|page\s*\d|date|po\b|purchase)", line, re.I):
             continue
         if re.match(r"^\d", line):
             continue
-        # Likely the vendor/company name
-        return ExtractedField(value=line, confidence=70, source="heuristic_position")
+        # Skip lines that look like dates (e.g. "Date: 2/28/2026")
+        if re.match(r"^date\s*[.:;\s]", line, re.I):
+            continue
+        if re.search(r"^\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}$", line):
+            continue
+        # Skip lines that are mostly numbers/symbols
+        alpha_chars = sum(1 for c in line if c.isalpha())
+        if alpha_chars < 3:
+            continue
+        return ExtractedField(value=line, confidence=65, source="heuristic_position")
     return ExtractedField(value=None, confidence=0, source="not_found")
 
 
@@ -183,6 +223,69 @@ def _extract_line_items_from_tables(pdf_path: str) -> tuple[list[LineItem], floa
     items = []
     base_confidence = 85  # table extraction is fairly reliable
 
+    # Column header keyword sets (order matters for disambiguation)
+    COL_KEYWORDS = {
+        "description": ["desc", "item", "particular", "product", "service", "name"],
+        "quantity": ["qty", "quantity", "qnty", "units", "count"],
+        "unit_price": ["unit price", "rate", "price per", "unit cost", "unit rate", "cost"],
+        "amount": ["amount", "line total", "ext", "extended", "net amount", "line amount"],
+        "uom": ["uom", "unit of measure"],
+        "po_line": ["po line", "po_line", "po #"],
+        "tax_rate": ["tax %", "tax rate", "vat %", "gst %"],
+        "tax_amount": ["tax amount", "tax", "vat", "gst"],
+    }
+
+    def _map_columns(header_row: list[str]) -> dict:
+        """Map column indices to field names with smarter matching."""
+        col_map = {}
+        used_indices = set()
+
+        # First pass: exact/substring matching, longest keyword first
+        for field_name, keywords in COL_KEYWORDS.items():
+            # Sort keywords by length descending so "unit price" matches before "price"
+            for kw in sorted(keywords, key=len, reverse=True):
+                for ci, col in enumerate(header_row):
+                    if ci in used_indices:
+                        continue
+                    if kw in col:
+                        col_map[field_name] = ci
+                        used_indices.add(ci)
+                        break
+                if field_name in col_map:
+                    break
+
+        # Handle "unit" ambiguity: if "unit" matched for uom but not unit_price,
+        # and there's a "price" column, prefer "unit" as unit_price
+        if "unit_price" not in col_map and "uom" in col_map:
+            uom_col = header_row[col_map["uom"]]
+            if "price" in uom_col or "cost" in uom_col or "rate" in uom_col:
+                col_map["unit_price"] = col_map.pop("uom")
+
+        # Handle "total" ambiguity: "total" alone maps to amount, not grand total
+        if "amount" not in col_map:
+            for ci, col in enumerate(header_row):
+                if ci in used_indices:
+                    continue
+                if "total" in col and "sub" not in col and "grand" not in col:
+                    col_map["amount"] = ci
+                    used_indices.add(ci)
+                    break
+
+        return col_map
+
+    def _is_number(val: str) -> bool:
+        """Check if a string looks like a number (with optional currency/commas)."""
+        cleaned = re.sub(r"[\$\£\€\¥,\s]", "", val)
+        try:
+            float(cleaned)
+            return True
+        except ValueError:
+            return False
+
+    def _clean_number(val: str) -> str:
+        """Strip currency symbols for cleaner output."""
+        return re.sub(r"[\$\£\€\¥]", "", val).strip()
+
     with pdfplumber.open(pdf_path) as pdf:
         for page in pdf.pages:
             tables = page.extract_tables()
@@ -203,21 +306,24 @@ def _extract_line_items_from_tables(pdf_path: str) -> tuple[list[LineItem], floa
                 if header_row is None:
                     continue
 
-                # Map columns
-                col_map = {}
-                for ci, col in enumerate(header_row):
-                    if any(k in col for k in ["desc", "item", "particular", "product", "service"]):
-                        col_map["description"] = ci
-                    elif any(k in col for k in ["qty", "quantity", "qnty"]):
-                        col_map["quantity"] = ci
-                    elif any(k in col for k in ["unit price", "rate", "price", "unit cost"]):
-                        col_map["unit_price"] = ci
-                    elif any(k in col for k in ["amount", "total", "line total", "ext"]):
-                        col_map["amount"] = ci
-                    elif any(k in col for k in ["uom", "unit of measure", "unit"]):
-                        col_map["uom"] = ci
-                    elif any(k in col for k in ["po line", "po_line"]):
-                        col_map["po_line"] = ci
+                col_map = _map_columns(header_row)
+
+                # If we couldn't map description, try positional heuristic:
+                # first text column is likely description
+                if "description" not in col_map and len(header_row) >= 3:
+                    for ci, col in enumerate(header_row):
+                        if ci not in col_map.values() and col and not any(
+                            kw in col for kw in ["#", "no", "sr", "sl"]
+                        ):
+                            col_map["description"] = ci
+                            break
+
+                # If we still have no amount, try the last numeric column
+                if "amount" not in col_map:
+                    for ci in range(len(header_row) - 1, -1, -1):
+                        if ci not in col_map.values():
+                            col_map["amount"] = ci
+                            break
 
                 # Extract data rows
                 for row in table[header_idx + 1:]:
@@ -226,35 +332,67 @@ def _extract_line_items_from_tables(pdf_path: str) -> tuple[list[LineItem], floa
 
                     # Skip summary rows
                     row_text = " ".join(str(c or "") for c in row).lower()
-                    if any(kw in row_text for kw in ["total", "subtotal", "sub-total", "tax", "vat", "grand"]):
+                    if any(kw in row_text for kw in ["total", "subtotal", "sub-total", "grand"]):
+                        continue
+                    # Skip rows that look like due dates or metadata
+                    if re.search(r"due\s*date|payment\s*due|pay\s*by|terms", row_text, re.I):
                         continue
 
                     li = LineItem(line_number=len(items) + 1)
 
+                    def _safe_get(r, idx):
+                        if idx is not None and idx < len(r):
+                            return str(r[idx] or "").strip()
+                        return ""
+
                     if "description" in col_map:
-                        val = str(row[col_map["description"]] or "").strip()
+                        val = _safe_get(row, col_map["description"])
                         if val:
                             li.description = ExtractedField(val, base_confidence, "table")
                     if "quantity" in col_map:
-                        val = str(row[col_map["quantity"]] or "").strip()
+                        val = _safe_get(row, col_map["quantity"])
                         if val:
-                            li.quantity = ExtractedField(val, base_confidence, "table")
+                            li.quantity = ExtractedField(_clean_number(val), base_confidence, "table")
                     if "unit_price" in col_map:
-                        val = str(row[col_map["unit_price"]] or "").strip()
+                        val = _safe_get(row, col_map["unit_price"])
                         if val:
-                            li.unit_price = ExtractedField(val, base_confidence, "table")
+                            li.unit_price = ExtractedField(_clean_number(val), base_confidence, "table")
                     if "amount" in col_map:
-                        val = str(row[col_map["amount"]] or "").strip()
+                        val = _safe_get(row, col_map["amount"])
                         if val:
-                            li.amount = ExtractedField(val, base_confidence, "table")
+                            li.amount = ExtractedField(_clean_number(val), base_confidence, "table")
                     if "uom" in col_map:
-                        val = str(row[col_map["uom"]] or "").strip()
+                        val = _safe_get(row, col_map["uom"])
                         if val:
                             li.unit_of_measure = ExtractedField(val, base_confidence, "table")
                     if "po_line" in col_map:
-                        val = str(row[col_map["po_line"]] or "").strip()
+                        val = _safe_get(row, col_map["po_line"])
                         if val:
                             li.po_line_number = ExtractedField(val, base_confidence, "table")
+
+                    # Sanity check: if "description" looks like it has embedded numbers
+                    # (e.g. all data crammed into one cell), try to split it
+                    if li.description.value and not li.quantity.value and not li.amount.value:
+                        desc_val = li.description.value
+                        # Pattern: description followed by qty, price, amount
+                        split_m = re.match(
+                            r"(.+?)\s+(\d+[\.,]?\d*)\s+[\$\£\€\¥]?([\d,]+\.?\d{0,2})\s+[\$\£\€\¥]?([\d,]+\.?\d{0,2})\s*$",
+                            desc_val,
+                        )
+                        if split_m:
+                            li.description = ExtractedField(split_m.group(1).strip(), 70, "table_split")
+                            li.quantity = ExtractedField(split_m.group(2).strip(), 70, "table_split")
+                            li.unit_price = ExtractedField(split_m.group(3).strip(), 70, "table_split")
+                            li.amount = ExtractedField(split_m.group(4).strip(), 70, "table_split")
+                        else:
+                            # Try: description + amount only
+                            split_m2 = re.match(
+                                r"(.+?)\s+[\$\£\€\¥]?([\d,]+\.?\d{0,2})\s*$",
+                                desc_val,
+                            )
+                            if split_m2 and len(split_m2.group(1)) > 3:
+                                li.description = ExtractedField(split_m2.group(1).strip(), 70, "table_split")
+                                li.amount = ExtractedField(split_m2.group(2).strip(), 70, "table_split")
 
                     # Only add if at least description or amount is present
                     if li.description.value or li.amount.value:
@@ -334,6 +472,13 @@ def extract_invoice(pdf_path: str) -> InvoiceData:
     if not line_items:
         line_items = _extract_line_items_from_text(raw_text)
     invoice.line_items = line_items
+
+    # Step 3b: If due date is still missing, scan the full text more broadly
+    if not invoice.due_date.value:
+        # Sometimes "Due Date" appears in table rows or footers
+        due_m = re.search(r"due\s*date\s*[^A-Za-z]*?(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})", raw_text, re.I)
+        if due_m:
+            invoice.due_date = ExtractedField(value=due_m.group(1).strip(), confidence=78, source="regex_broad")
 
     # Step 4: Cross-validate totals for bonus confidence
     _cross_validate(invoice)
