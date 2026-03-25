@@ -14,11 +14,11 @@ class ExtractedField:
 
     @property
     def confidence_label(self) -> str:
-        if self.confidence >= 90:
+        if self.confidence >= 95:
             return "HIGH"
-        elif self.confidence >= 70:
+        elif self.confidence >= 85:
             return "MEDIUM"
-        elif self.confidence >= 50:
+        elif self.confidence >= 70:
             return "LOW"
         return "VERY LOW"
 

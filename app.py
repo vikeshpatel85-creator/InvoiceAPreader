@@ -33,7 +33,7 @@ st.markdown("Upload a PDF invoice to extract data for **three-way match** (Invoi
 # ---------------------------------------------------------------------------
 st.sidebar.header("Settings")
 confidence_threshold = st.sidebar.slider(
-    "Flag fields below confidence %", 0, 100, 70,
+    "Flag fields below confidence %", 0, 100, 85,
     help="Fields below this threshold will be highlighted for manual review.",
 )
 export_format = st.sidebar.selectbox("Export format", ["JSON", "CSV", "Excel"])
@@ -57,9 +57,9 @@ if uploaded_file is not None:
         # Overall confidence banner
         # ---------------------------------------------------------------
         overall = invoice.overall_confidence
-        if overall >= 85:
+        if overall >= 95:
             st.success(f"Overall extraction confidence: **{overall}%** — High")
-        elif overall >= 65:
+        elif overall >= 85:
             st.warning(f"Overall extraction confidence: **{overall}%** — Medium (review flagged fields)")
         else:
             st.error(f"Overall extraction confidence: **{overall}%** — Low (manual review recommended)")
@@ -82,7 +82,7 @@ if uploaded_file is not None:
             with cols[i % 3]:
                 val = field.value or "—"
                 conf = field.confidence
-                if conf >= 85:
+                if conf >= 95:
                     badge = f"🟢 {conf}%"
                 elif conf >= confidence_threshold:
                     badge = f"🟡 {conf}%"
@@ -224,7 +224,7 @@ else:
     | **Line Items** | Description, Quantity, Unit Price, Amount, UOM |
 
     ### Confidence Scoring
-    - 🟢 **HIGH (≥85%)** — Field extracted with strong pattern match
-    - 🟡 **MEDIUM (70-84%)** — Reasonable match, worth verifying
-    - 🔴 **LOW (<70%)** — Flagged for manual review before ERP import
+    - 🟢 **HIGH (≥95%)** — Field extracted with high-accuracy pattern match
+    - 🟡 **MEDIUM (85-94%)** — Reasonable match, worth verifying
+    - 🔴 **LOW (<85%)** — Flagged for manual review before ERP import
     """)
